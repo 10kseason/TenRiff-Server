@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ ninja-build \
+    cmake g++ ninja-build libsqlite3-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -12,6 +12,9 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && ctest --test-dir build --output-on-failure
 
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsqlite3-0 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/tenriff-server /usr/local/bin/tenriff-server
 EXPOSE 27300/tcp 27302/tcp
 USER 65532:65532

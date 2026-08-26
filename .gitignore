@@ -7,3 +7,10 @@
 *.pdb
 *.ilk
 *.exe
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+/secrets/
+/runtime/
+/catalog/*
+!/catalog/approved-charts.txt

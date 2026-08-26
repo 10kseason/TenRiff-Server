@@ -1,6 +1,7 @@
 #include "tenriff_server/TcpServer.h"
 #include "tenriff_server/HttpApiServer.h"
 #include "tenriff_server/OnlineRecordStore.h"
+#include "tenriff_server/RankedDatabase.h"
 
 #include <atomic>
 #include <charconv>
@@ -8,9 +9,12 @@
 #include <csignal>
 #include <cstdint>
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -43,12 +47,18 @@ void signal_handler(int) {
 
 void print_help() {
     std::cout
-        << "TenRiff Server 0.2.0-dev\n"
+        << "TenRiff Server 1.0.0\n"
         << "Usage: tenriff-server [options]\n\n"
         << "  --bind <IPv4>       Game/API listen address (default: 0.0.0.0)\n"
         << "  --port <port>       Game protocol TCP port (default: 27300)\n"
-        << "  --api-port <port>   Read-only records HTTP port (default: 27302)\n"
+        << "  --api-port <port>   Account/records HTTP port (default: 27302)\n"
         << "  --records <path>    Verified BMS records JSONL snapshot\n"
+        << "  --database <path>   SQLite ranked database\n"
+        << "  --receipt-secret-file <path>  File containing 32+ byte receipt HMAC secret\n"
+        << "  --verifier <path>   tenriff-replay-verifier executable\n"
+        << "  --replay-staging <path>  Temporary replay evidence directory\n"
+        << "  --approve-chart <sha256=path> Add/update approved BMS chart (repeatable)\n"
+        << "  --approve-chart-file <path> Read SHA256=path catalog lines\n"
         << "  --name <text>       Server name (max 64 UTF-8 bytes)\n"
         << "  --help              Show this help\n";
 }
@@ -70,6 +80,9 @@ int main(int argc, char** argv) {
     tenriff::server::ServerOptions options;
     tenriff::server::HttpApiOptions api_options;
     std::string records_path;
+    std::string database_path;
+    std::string receipt_secret_file;
+    std::vector<std::pair<std::string, std::string>> approved_charts;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
@@ -78,6 +91,9 @@ int main(int argc, char** argv) {
         }
         if ((argument == "--bind" || argument == "--port" ||
              argument == "--api-port" || argument == "--records" ||
+             argument == "--database" || argument == "--receipt-secret-file" ||
+             argument == "--verifier" || argument == "--replay-staging" ||
+             argument == "--approve-chart" || argument == "--approve-chart-file" ||
              argument == "--name") && index + 1 >= argc) {
             std::cerr << argument << " requires a value.\n";
             return 2;
@@ -100,6 +116,40 @@ int main(int argc, char** argv) {
             if (records_path.empty()) {
                 std::cerr << "--records must not be empty.\n";
                 return 2;
+            }
+        } else if (argument == "--database") {
+            database_path = argv[++index];
+        } else if (argument == "--receipt-secret-file") {
+            receipt_secret_file = argv[++index];
+        } else if (argument == "--verifier") {
+            api_options.verifier_executable = argv[++index];
+        } else if (argument == "--replay-staging") {
+            api_options.replay_staging_directory = argv[++index];
+        } else if (argument == "--approve-chart") {
+            const std::string value = argv[++index];
+            const auto equals = value.find('=');
+            if (equals == std::string::npos || equals == 0 || equals + 1 >= value.size()) {
+                std::cerr << "--approve-chart must be SHA256=local-path.\n";
+                return 2;
+            }
+            approved_charts.emplace_back(value.substr(0, equals), value.substr(equals + 1));
+        } else if (argument == "--approve-chart-file") {
+            const std::string catalog_path = argv[++index];
+            std::ifstream catalog(catalog_path);
+            if (!catalog) {
+                std::cerr << "Could not open approved chart catalog: " << catalog_path << "\n";
+                return 2;
+            }
+            std::string line;
+            while (std::getline(catalog, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty() || line.front() == '#') continue;
+                const auto equals = line.find('=');
+                if (equals == std::string::npos || equals == 0 || equals + 1 >= line.size()) {
+                    std::cerr << "Invalid approved chart catalog line: " << line << "\n";
+                    return 2;
+                }
+                approved_charts.emplace_back(line.substr(0, equals), line.substr(equals + 1));
             }
         } else if (argument == "--name") {
             options.name = argv[++index];
@@ -131,7 +181,37 @@ int main(int argc, char** argv) {
               << " verified BMS records; ignored " << records.ignored_count()
               << " ineligible records.\n";
 
-    tenriff::server::HttpApiServer api(std::move(api_options), records);
+    tenriff::server::RankedDatabase ranked_database;
+    tenriff::server::RankedDatabase* ranked_database_ptr = nullptr;
+    if (!database_path.empty() || !receipt_secret_file.empty() ||
+        !api_options.verifier_executable.empty() || !approved_charts.empty()) {
+        if (database_path.empty() || receipt_secret_file.empty() ||
+            api_options.verifier_executable.empty()) {
+            std::cerr << "TenRiff Server failed: --database, --receipt-secret-file, and --verifier are all required for ranked uploads.\n";
+            return 2;
+        }
+        std::ifstream secret_input(receipt_secret_file, std::ios::binary);
+        const std::string signing_secret((std::istreambuf_iterator<char>(secret_input)),
+                                         std::istreambuf_iterator<char>());
+        if (!secret_input && signing_secret.empty()) {
+            std::cerr << "TenRiff Server failed: could not read receipt secret file.\n";
+            return 1;
+        }
+        if (!ranked_database.open(database_path, signing_secret, error)) {
+            std::cerr << "TenRiff Server failed: " << error << "\n";
+            return 1;
+        }
+        for (const auto& approved : approved_charts) {
+            if (!ranked_database.approve_bms_chart(approved.first, approved.second, error)) {
+                std::cerr << "TenRiff Server failed: " << error << "\n";
+                return 1;
+            }
+        }
+        ranked_database_ptr = &ranked_database;
+        std::cout << "[TenRiff-Server] Ranked DB migrations applied; account and replay upload API enabled.\n";
+    }
+
+    tenriff::server::HttpApiServer api(std::move(api_options), records, ranked_database_ptr);
     bool api_ok = false;
     std::string api_error;
     std::atomic_bool api_finished{false};

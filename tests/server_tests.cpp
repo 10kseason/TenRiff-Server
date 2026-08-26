@@ -1,6 +1,7 @@
 #include "tenriff_server/Coordinator.h"
 #include "tenriff_server/HttpApiServer.h"
 #include "tenriff_server/OnlineRecordStore.h"
+#include "tenriff_server/RankedDatabase.h"
 #include "tenriff_server/Protocol.h"
 #include "tenriff_server/TcpServer.h"
 
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -272,6 +274,77 @@ void test_online_record_store_filters_and_sorts() {
     std::filesystem::remove(path, ignored);
 }
 
+void test_ranked_database_accounts_challenges_and_verified_records() {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "tenriff_server_ranked_test.sqlite3";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(path.string() + "-wal", ignored);
+    std::filesystem::remove(path.string() + "-shm", ignored);
+
+    tenriff::server::RankedDatabase database;
+    std::string error;
+    CHECK(database.open(path.string(), std::string(48, 's'), error));
+    CHECK(error.empty());
+
+    tenriff::server::AccountSession registered;
+    tenriff::server::AccountSession invalid;
+    CHECK(!database.register_account(std::string("bad\xff", 4),
+                                     "correct horse battery", invalid, error));
+    CHECK(database.register_account("ranked-player", "correct horse battery", registered, error));
+    CHECK(!registered.bearer_token.empty());
+    tenriff::server::AccountSession duplicate;
+    CHECK(!database.register_account("ranked-player", "another long password", duplicate, error));
+
+    tenriff::server::AccountSession login;
+    CHECK(!database.login("ranked-player", "wrong password value", login, error));
+    CHECK(database.login("RANKED-PLAYER", "correct horse battery", login, error));
+    CHECK(!login.bearer_token.empty());
+
+    const std::string chart_hash(64, 'b');
+    CHECK(database.approve_bms_chart(chart_hash, "catalog/chart.bms", error));
+    tenriff::server::ReplayChallenge challenge;
+    CHECK(database.create_challenge(login.bearer_token, chart_hash, challenge, error));
+    CHECK(challenge.chart_sha256 == chart_hash);
+    CHECK(challenge.chart_path == "catalog/chart.bms");
+
+    tenriff::server::ReplayChallenge inspected;
+    CHECK(database.inspect_challenge(login.bearer_token, challenge.id, inspected, error));
+    CHECK(inspected.nonce == challenge.nonce);
+
+    tenriff::server::VerifiedReplayRecord verified;
+    verified.chart_sha256 = chart_hash;
+    verified.replay_sha256 = std::string(64, 'c');
+    verified.score = 9876;
+    verified.accuracy = 98.76;
+    verified.max_combo = 321;
+    verified.clear_status = "HARD";
+    verified.ruleset_id = "tenriff-native-score-v2-ruleset-1";
+    std::string receipt;
+    CHECK(database.commit_verified_replay(login.bearer_token, challenge.id,
+                                          verified, receipt, error));
+    CHECK(receipt.rfind("v1.", 0) == 0);
+    CHECK(!database.inspect_challenge(login.bearer_token, challenge.id, inspected, error));
+    const auto leaderboard = database.leaderboard(chart_hash, 10);
+    CHECK(leaderboard.size() == 1);
+    if (!leaderboard.empty()) {
+        CHECK(leaderboard[0].player_name == "ranked-player");
+        CHECK(leaderboard[0].score == 9876);
+        CHECK(leaderboard[0].verification_status == "online_verified");
+    }
+
+    tenriff::server::ReplayChallenge overflow_challenge;
+    CHECK(database.create_challenge(login.bearer_token, chart_hash,
+                                    overflow_challenge, error));
+    verified.replay_sha256 = std::string(64, 'e');
+    verified.score = (std::numeric_limits<std::uint64_t>::max)();
+    CHECK(!database.commit_verified_replay(login.bearer_token,
+                                           overflow_challenge.id,
+                                           verified, receipt, error));
+    CHECK(database.inspect_challenge(login.bearer_token,
+                                     overflow_challenge.id, inspected, error));
+}
+
 #ifdef _WIN32
 using TestSocket = SOCKET;
 constexpr TestSocket kInvalidTestSocket = INVALID_SOCKET;
@@ -344,6 +417,16 @@ std::string receive_http(TestClient& client) {
         if (response.size() > 128 * 1024) break;
     }
     return response;
+}
+
+std::string response_json_string(const std::string& response,
+                                 const std::string& key) {
+    const std::string marker = "\"" + key + "\":\"";
+    const auto begin = response.find(marker);
+    if (begin == std::string::npos) return {};
+    const auto value_begin = begin + marker.size();
+    const auto end = response.find('"', value_begin);
+    return end == std::string::npos ? std::string{} : response.substr(value_begin, end - value_begin);
 }
 
 bool receive_type(TestClient& client,
@@ -503,6 +586,110 @@ void test_http_records_api() {
     CHECK(leaderboard_response.find("HTTP/1.1 200 OK") != std::string::npos);
     CHECK(leaderboard_response.find("\"records\":[]") != std::string::npos);
 
+    TestClient missing_length;
+    CHECK(connect_client(missing_length, api.bound_port()));
+    CHECK(send_raw(missing_length,
+                   "POST /v1/accounts/login HTTP/1.1\r\nHost: localhost\r\n"
+                   "Content-Type: application/json\r\n\r\n"));
+    const auto missing_length_response = receive_http(missing_length);
+    CHECK(missing_length_response.find("HTTP/1.1 411 Length Required") !=
+          std::string::npos);
+
+    stop.store(true, std::memory_order_release);
+    worker.join();
+    CHECK(api_ok);
+    CHECK(api_error.empty());
+}
+
+void test_http_account_and_bms_challenge_api() {
+    TestSocketRuntime sockets;
+    CHECK(sockets.ok);
+    if (!sockets.ok) return;
+
+    const auto database_path = std::filesystem::temp_directory_path() /
+                               "tenriff_server_http_ranked.sqlite3";
+    std::error_code ignored;
+    std::filesystem::remove(database_path, ignored);
+    std::filesystem::remove(database_path.string() + "-wal", ignored);
+    std::filesystem::remove(database_path.string() + "-shm", ignored);
+
+    tenriff::server::RankedDatabase database;
+    std::string database_error;
+    CHECK(database.open(database_path.string(), std::string(48, 'h'), database_error));
+    const std::string chart_hash(64, 'd');
+    CHECK(database.approve_bms_chart(chart_hash, "catalog/ranked.bms", database_error));
+
+    tenriff::server::OnlineRecordStore store;
+    std::string load_error;
+    CHECK(store.load_json_lines("", load_error));
+    tenriff::server::HttpApiOptions options;
+    options.bind_address = "127.0.0.1";
+    options.port = 0;
+    options.verifier_executable = TENRIFF_TEST_VERIFIER_PATH;
+    tenriff::server::HttpApiServer api(options, store, &database);
+    std::atomic_bool stop{false};
+    std::string api_error;
+    bool api_ok = false;
+    std::thread worker([&] { api_ok = api.run(stop, api_error); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (api.bound_port() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(api.bound_port() != 0);
+
+    const std::string account_body =
+        "{\"username\":\"http-player\",\"password\":\"safe password value\"}";
+    TestClient account;
+    CHECK(connect_client(account, api.bound_port()));
+    CHECK(send_raw(account,
+        "POST /v1/accounts/register HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(account_body.size()) + "\r\n\r\n" + account_body));
+    const std::string account_response = receive_http(account);
+    CHECK(account_response.find("HTTP/1.1 201 Created") != std::string::npos);
+    const std::string token = response_json_string(account_response, "token");
+    CHECK(!token.empty());
+
+    const std::string challenge_body =
+        "{\"chart_sha256\":\"" + chart_hash + "\"}";
+    TestClient challenge;
+    CHECK(connect_client(challenge, api.bound_port()));
+    CHECK(send_raw(challenge,
+        "POST /v1/challenges HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token +
+        "\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(challenge_body.size()) + "\r\n\r\n" + challenge_body));
+    const std::string challenge_response = receive_http(challenge);
+    CHECK(challenge_response.find("HTTP/1.1 201 Created") != std::string::npos);
+    CHECK(!response_json_string(challenge_response, "challenge_id").empty());
+    CHECK(!response_json_string(challenge_response, "nonce").empty());
+    const std::string challenge_id = response_json_string(challenge_response, "challenge_id");
+    const std::string nonce = response_json_string(challenge_response, "nonce");
+
+    const std::string replay_body =
+        "{\"challenge_id\":\"" + challenge_id +
+        "\",\"challenge_nonce\":\"" + nonce +
+        "\",\"replay_base64\":\"e30=\"}";
+    TestClient replay;
+    CHECK(connect_client(replay, api.bound_port()));
+    CHECK(send_raw(replay,
+        "POST /v1/replays HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token +
+        "\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(replay_body.size()) + "\r\n\r\n" + replay_body));
+    const std::string replay_response = receive_http(replay);
+    CHECK(replay_response.find("HTTP/1.1 201 Created") != std::string::npos);
+    CHECK(replay_response.find("online_verified") != std::string::npos);
+    CHECK(!response_json_string(replay_response, "receipt").empty());
+
+    const std::string osu_body =
+        "{\"chart_sha256\":\"" + std::string(64, 'e') + "\"}";
+    TestClient osu;
+    CHECK(connect_client(osu, api.bound_port()));
+    CHECK(send_raw(osu,
+        "POST /v1/challenges HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token +
+        "\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(osu_body.size()) + "\r\n\r\n" + osu_body));
+    const std::string osu_response = receive_http(osu);
+    CHECK(osu_response.find("HTTP/1.1 422 Unprocessable Content") != std::string::npos);
+
     stop.store(true, std::memory_order_release);
     worker.join();
     CHECK(api_ok);
@@ -517,8 +704,10 @@ int main() {
     test_coordinator_full_round();
     test_coordinator_rejections_and_attribution();
     test_online_record_store_filters_and_sorts();
+    test_ranked_database_accounts_challenges_and_verified_records();
     test_tcp_handshake_and_common_library();
     test_http_records_api();
+    test_http_account_and_bms_challenge_api();
     if (failures != 0) {
         std::cerr << failures << " test checks failed.\n";
         return 1;

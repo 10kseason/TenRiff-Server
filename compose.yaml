@@ -1,0 +1,72 @@
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    command:
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "27300"
+      - --api-port
+      - "27302"
+      - --database
+      - /var/lib/tenriff/tenriff.sqlite3
+      - --receipt-secret-file
+      - /run/secrets/receipt-secret
+      - --verifier
+      - /opt/tenriff/tenriff-replay-verifier
+      - --replay-staging
+      - /var/lib/tenriff/replay-staging
+      - --approve-chart-file
+      - /etc/tenriff/approved-charts.txt
+      - --name
+      - ${TENRIFF_SERVER_NAME:-TenRiff Ranked Server}
+    ports:
+      - "27300:27300/tcp"
+    expose:
+      - "27302"
+    volumes:
+      - tenriff-data:/var/lib/tenriff
+      - ./runtime/tenriff-replay-verifier:/opt/tenriff/tenriff-replay-verifier:ro
+      - ./catalog:/charts:ro
+      - ./catalog/approved-charts.txt:/etc/tenriff/approved-charts.txt:ro
+    secrets:
+      - receipt-secret
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      TENRIFF_DOMAIN: ${TENRIFF_DOMAIN:-localhost}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+volumes:
+  tenriff-data:
+  caddy-data:
+  caddy-config:
+
+secrets:
+  receipt-secret:
+    file: ./secrets/receipt-secret

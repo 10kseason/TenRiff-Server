@@ -6,6 +6,7 @@
 #include <string>
 
 #include "tenriff_server/OnlineRecordStore.h"
+#include "tenriff_server/RankedDatabase.h"
 
 namespace tenriff::server {
 
@@ -13,11 +14,15 @@ struct HttpApiOptions {
     std::string bind_address = "0.0.0.0";
     std::uint16_t port = 27302;
     std::string server_name = "TenRiff Headless Server";
+    std::string verifier_executable;
+    std::string replay_staging_directory = "data/replay-staging";
 };
 
 class HttpApiServer {
 public:
-    HttpApiServer(HttpApiOptions options, const OnlineRecordStore& records);
+    HttpApiServer(HttpApiOptions options,
+                  const OnlineRecordStore& records,
+                  RankedDatabase* ranked_database = nullptr);
     ~HttpApiServer();
 
     HttpApiServer(const HttpApiServer&) = delete;

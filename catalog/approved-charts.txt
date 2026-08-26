@@ -1,0 +1,2 @@
+# One approved BMS-family chart per line. Paths are container paths under /charts.
+# 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef=/charts/example/chart.bms

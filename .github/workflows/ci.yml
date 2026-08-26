@@ -12,6 +12,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Configure
         run: cmake -S . -B build -DTENRIFF_SERVER_BUILD_TESTS=ON
       - name: Build
@@ -23,6 +26,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Configure ASan
         run: >-
           cmake -S . -B build-asan
@@ -33,3 +38,10 @@ jobs:
         run: cmake --build build-asan --parallel
       - name: Test ASan
         run: ctest --test-dir build-asan --output-on-failure
+
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tested runtime image
+        run: docker build --tag tenriff-server:${{ github.sha }} .

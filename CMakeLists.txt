@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(TenRiffServer VERSION 0.2.0 LANGUAGES CXX)
+project(TenRiffServer VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,18 +33,25 @@ add_library(tenriff_server_core
     src/Coordinator.cpp
     src/OnlineRecordStore.cpp
     src/Protocol.cpp
+    src/RankedDatabase.cpp
 )
 target_include_directories(tenriff_server_core PUBLIC include)
 
 add_library(tenriff_server_net
     src/HttpApiServer.cpp
+    src/ReplayVerifierProcess.cpp
     src/TcpServer.cpp
 )
 target_include_directories(tenriff_server_net PUBLIC include)
 target_link_libraries(tenriff_server_net PUBLIC tenriff_server_core)
 
 if(WIN32)
+    target_link_libraries(tenriff_server_core PUBLIC winsqlite3 bcrypt)
     target_link_libraries(tenriff_server_net PUBLIC ws2_32)
+else()
+    find_package(SQLite3 REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(tenriff_server_core PUBLIC SQLite::SQLite3 OpenSSL::Crypto)
 endif()
 
 add_executable(tenriff-server src/main.cpp)
@@ -56,6 +63,10 @@ if(TENRIFF_SERVER_BUILD_TESTS)
     enable_testing()
     add_executable(tenriff_server_tests tests/server_tests.cpp)
     target_link_libraries(tenriff_server_tests PRIVATE tenriff_server_net)
+    add_executable(tenriff_mock_replay_verifier tests/mock_replay_verifier.cpp)
+    target_compile_definitions(tenriff_server_tests PRIVATE
+        TENRIFF_TEST_VERIFIER_PATH="$<TARGET_FILE:tenriff_mock_replay_verifier>")
+    add_dependencies(tenriff_server_tests tenriff_mock_replay_verifier)
     add_test(NAME tenriff_server_tests COMMAND tenriff_server_tests)
     set_tests_properties(tenriff_server_tests PROPERTIES TIMEOUT 30)
 
