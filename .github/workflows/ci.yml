@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DTENRIFF_SERVER_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure ASan
+        run: >-
+          cmake -S . -B build-asan
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DTENRIFF_SERVER_BUILD_TESTS=ON
+          -DTENRIFF_SERVER_ENABLE_ASAN=ON
+      - name: Build ASan
+        run: cmake --build build-asan --parallel
+      - name: Test ASan
+        run: ctest --test-dir build-asan --output-on-failure

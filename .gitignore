@@ -1,0 +1,9 @@
+/build*/
+/.vs/
+/.vscode/
+*.user
+*.suo
+*.log
+*.pdb
+*.ilk
+*.exe
