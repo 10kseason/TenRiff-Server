@@ -1,10 +1,14 @@
 #include "tenriff_server/Coordinator.h"
+#include "tenriff_server/HttpApiServer.h"
+#include "tenriff_server/OnlineRecordStore.h"
 #include "tenriff_server/Protocol.h"
 #include "tenriff_server/TcpServer.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -219,6 +223,55 @@ void test_coordinator_rejections_and_attribution() {
     CHECK(chat_result.deliveries[0].message.player_id == 2);
 }
 
+void test_online_record_store_filters_and_sorts() {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "tenriff_server_records_test.jsonl";
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output
+            << "{\"chart_sha256\":\"" << std::string(64, 'a')
+            << "\",\"chart_format\":\"bms\",\"player_name\":\"Second\","
+               "\"score\":800000,\"accuracy\":98.0,\"max_combo\":500,"
+               "\"clear_status\":\"CLEAR\",\"ruleset_id\":\"ranked-v1\","
+               "\"verification_status\":\"online_verified\","
+               "\"verified_at_utc\":\"2026-08-26T00:00:01Z\"}\n"
+            << "{\"chart_sha256\":\"" << std::string(64, 'a')
+            << "\",\"chart_format\":\"bms\",\"player_name\":\"First\","
+               "\"score\":900000,\"accuracy\":97.0,\"max_combo\":400,"
+               "\"clear_status\":\"HARD\",\"ruleset_id\":\"ranked-v1\","
+               "\"verification_status\":\"online_verified\","
+               "\"verified_at_utc\":\"2026-08-26T00:00:02Z\"}\n"
+            << "{\"chart_sha256\":\"" << std::string(64, 'a')
+            << "\",\"chart_format\":\"osu\",\"player_name\":\"Foreign\","
+               "\"score\":999999,\"accuracy\":100.0,\"max_combo\":999,"
+               "\"clear_status\":\"CLEAR\",\"ruleset_id\":\"foreign\","
+               "\"verification_status\":\"online_verified\","
+               "\"verified_at_utc\":\"2026-08-26T00:00:03Z\"}\n"
+            << "{\"chart_sha256\":\"" << std::string(64, 'a')
+            << "\",\"chart_format\":\"bms\",\"player_name\":\"Claim\","
+               "\"score\":999999,\"accuracy\":100.0,\"max_combo\":999,"
+               "\"clear_status\":\"CLEAR\",\"ruleset_id\":\"ranked-v1\","
+               "\"verification_status\":\"client_claim\","
+               "\"verified_at_utc\":\"2026-08-26T00:00:04Z\"}\n";
+    }
+    tenriff::server::OnlineRecordStore store;
+    std::string error;
+    CHECK(store.load_json_lines(path.string(), error));
+    CHECK(error.empty());
+    CHECK(store.record_count() == 2);
+    CHECK(store.ignored_count() == 2);
+    const auto records = store.leaderboard(std::string(64, 'A'), 10);
+    CHECK(records.size() == 2);
+    CHECK(records[0].player_name == "First");
+    CHECK(records[1].player_name == "Second");
+    const auto json = tenriff::server::online_records_json(
+        std::string(64, 'a'), records);
+    CHECK(json.find("\"rank\":1") != std::string::npos);
+    CHECK(json.find("Foreign") == std::string::npos);
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
 #ifdef _WIN32
 using TestSocket = SOCKET;
 constexpr TestSocket kInvalidTestSocket = INVALID_SOCKET;
@@ -268,6 +321,29 @@ bool send_message(TestClient& client, const protocol::Message& message) {
         sent_total += static_cast<std::size_t>(sent);
     }
     return true;
+}
+
+bool send_raw(TestClient& client, const std::string& data) {
+    std::size_t sent_total = 0;
+    while (sent_total < data.size()) {
+        const int sent = send(client.socket, data.data() + sent_total,
+                              static_cast<int>(data.size() - sent_total), 0);
+        if (sent <= 0) return false;
+        sent_total += static_cast<std::size_t>(sent);
+    }
+    return true;
+}
+
+std::string receive_http(TestClient& client) {
+    std::string response;
+    for (;;) {
+        char buffer[4096];
+        const int count = recv(client.socket, buffer, static_cast<int>(sizeof(buffer)), 0);
+        if (count <= 0) break;
+        response.append(buffer, static_cast<std::size_t>(count));
+        if (response.size() > 128 * 1024) break;
+    }
+    return response;
 }
 
 bool receive_type(TestClient& client,
@@ -388,6 +464,51 @@ void test_tcp_handshake_and_common_library() {
     CHECK(server_error.empty());
 }
 
+void test_http_records_api() {
+    TestSocketRuntime sockets;
+    CHECK(sockets.ok);
+    if (!sockets.ok) return;
+
+    tenriff::server::OnlineRecordStore store;
+    std::string load_error;
+    CHECK(store.load_json_lines("", load_error));
+    tenriff::server::HttpApiOptions options;
+    options.bind_address = "127.0.0.1";
+    options.port = 0;
+    options.server_name = "API Test";
+    tenriff::server::HttpApiServer api(options, store);
+    std::atomic_bool stop{false};
+    std::string api_error;
+    bool api_ok = false;
+    std::thread worker([&] { api_ok = api.run(stop, api_error); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (api.bound_port() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(api.bound_port() != 0);
+
+    TestClient health;
+    CHECK(connect_client(health, api.bound_port()));
+    CHECK(send_raw(health, "GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    const auto health_response = receive_http(health);
+    CHECK(health_response.find("HTTP/1.1 200 OK") != std::string::npos);
+    CHECK(health_response.find("\"status\":\"ok\"") != std::string::npos);
+
+    TestClient leaderboard;
+    CHECK(connect_client(leaderboard, api.bound_port()));
+    CHECK(send_raw(leaderboard,
+                   "GET /v1/leaderboards/" + std::string(64, 'a') +
+                       "?limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    const auto leaderboard_response = receive_http(leaderboard);
+    CHECK(leaderboard_response.find("HTTP/1.1 200 OK") != std::string::npos);
+    CHECK(leaderboard_response.find("\"records\":[]") != std::string::npos);
+
+    stop.store(true, std::memory_order_release);
+    worker.join();
+    CHECK(api_ok);
+    CHECK(api_error.empty());
+}
+
 }  // namespace
 
 int main() {
@@ -395,7 +516,9 @@ int main() {
     test_protocol_bounds();
     test_coordinator_full_round();
     test_coordinator_rejections_and_attribution();
+    test_online_record_store_filters_and_sorts();
     test_tcp_handshake_and_common_library();
+    test_http_records_api();
     if (failures != 0) {
         std::cerr << failures << " test checks failed.\n";
         return 1;

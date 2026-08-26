@@ -1,6 +1,6 @@
 # 서버 단계 계획
 
-## 0.1 — 헤드리스 코디네이터 (현재)
+## 0.1 — 헤드리스 코디네이터 (완료)
 
 - 기존 TenRiff protocol v5 join 클라이언트 호환
 - 단일 방, 직접 `host:port` 접속
@@ -15,12 +15,12 @@
 - Docker 이미지와 Windows 서비스/Linux systemd 예시
 - protocol golden vector를 클라이언트 CI에서도 교차 검증
 
-## 0.3 — 읽기 전용 온라인 기록
+## 0.3 — 읽기 전용 온라인 기록 (개발 기반 완료, 공개 운영 미완료)
 
-- 별도 버전 API와 TLS
-- 승인된 BMS SHA-256 catalog
-- leaderboard 조회만 우선 제공
-- `.osu` 및 osu 파생 기록은 `ranked_ineligible_osu`로 fail-closed
+- 완료: 별도 schema-v1 HTTP API, health/server-info/leaderboard 조회
+- 완료: `bms + online_verified` JSONL만 읽고 `.osu`/client claim fail-closed
+- 남음: 승인된 BMS SHA-256 catalog와 스냅샷 서명/검증 파이프라인
+- 남음: HTTPS reverse proxy, rate limit, 운영 배포와 관측성
 
 ## 0.4 — shadow replay 검증
 

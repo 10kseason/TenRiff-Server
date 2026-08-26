@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(TenRiffServer VERSION 0.1.0 LANGUAGES CXX)
+project(TenRiffServer VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,11 +31,13 @@ endif()
 
 add_library(tenriff_server_core
     src/Coordinator.cpp
+    src/OnlineRecordStore.cpp
     src/Protocol.cpp
 )
 target_include_directories(tenriff_server_core PUBLIC include)
 
 add_library(tenriff_server_net
+    src/HttpApiServer.cpp
     src/TcpServer.cpp
 )
 target_include_directories(tenriff_server_net PUBLIC include)
