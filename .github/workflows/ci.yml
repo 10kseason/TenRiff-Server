@@ -46,7 +46,7 @@ jobs:
       - name: Build tested runtime image
         run: docker build --tag tenriff-server:${{ github.sha }} .
       - name: Scan runtime image
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: tenriff-server:${{ github.sha }}
           format: table
