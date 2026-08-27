@@ -11,12 +11,13 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build \
     && ctest --test-dir build --output-on-failure
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 libssl3 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    libsqlite3-0 libssl3t64 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o 65532 -g 65532 /var/lib/tenriff
 COPY --from=build /src/build/tenriff-server /usr/local/bin/tenriff-server
-EXPOSE 27300/tcp 27302/tcp
+EXPOSE 27301/tcp 27302/tcp
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/tenriff-server"]
-CMD ["--bind", "0.0.0.0", "--port", "27300", "--api-port", "27302"]
+CMD ["--bind", "0.0.0.0", "--port", "27301", "--api-port", "27302"]

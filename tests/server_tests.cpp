@@ -1,3 +1,4 @@
+#include "tenriff_server/BmsCatalog.h"
 #include "tenriff_server/Coordinator.h"
 #include "tenriff_server/HttpApiServer.h"
 #include "tenriff_server/OnlineRecordStore.h"
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,7 +27,9 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <winsqlite/winsqlite3.h>
 #else
+#include <sqlite3.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -274,6 +278,49 @@ void test_online_record_store_filters_and_sorts() {
     std::filesystem::remove(path, ignored);
 }
 
+void test_bms_catalog_default_allow_and_exclusions() {
+    const auto root = std::filesystem::temp_directory_path() /
+                      "tenriff_server_bms_catalog_test";
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    std::filesystem::create_directories(root / "nested", ignored);
+    {
+        std::ofstream(root / "a.bms", std::ios::binary) << "abc";
+        std::ofstream(root / "nested" / "b.BME", std::ios::binary) << "def";
+        std::ofstream(root / "duplicate.pms", std::ios::binary) << "abc";
+        std::ofstream(root / "ignored.osu", std::ios::binary) << "ghi";
+        std::ofstream(root / "excluded-charts.txt", std::ios::binary) << "# none\n";
+    }
+
+    tenriff::server::BmsCatalogLoadResult catalog;
+    std::string error;
+    CHECK(tenriff::server::load_bms_catalog(
+        root, root / "excluded-charts.txt", catalog, error));
+    CHECK(error.empty());
+    CHECK(catalog.charts.size() == 2);
+    CHECK(catalog.duplicate_count == 1);
+
+    const std::string abc_sha256 =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    {
+        std::ofstream(root / "excluded-charts.txt", std::ios::binary | std::ios::trunc)
+            << abc_sha256 << " # operator exclusion\n";
+    }
+    CHECK(tenriff::server::load_bms_catalog(
+        root, root / "excluded-charts.txt", catalog, error));
+    CHECK(catalog.charts.size() == 1);
+    CHECK(catalog.excluded_count == 2);
+
+    {
+        std::ofstream(root / "excluded-charts.txt", std::ios::binary | std::ios::trunc)
+            << "not-a-sha256\n";
+    }
+    CHECK(!tenriff::server::load_bms_catalog(
+        root, root / "excluded-charts.txt", catalog, error));
+    CHECK(!error.empty());
+    std::filesystem::remove_all(root, ignored);
+}
+
 void test_ranked_database_accounts_challenges_and_verified_records() {
     const auto path = std::filesystem::temp_directory_path() /
                       "tenriff_server_ranked_test.sqlite3";
@@ -293,6 +340,7 @@ void test_ranked_database_accounts_challenges_and_verified_records() {
                                      "correct horse battery", invalid, error));
     CHECK(database.register_account("ranked-player", "correct horse battery", registered, error));
     CHECK(!registered.bearer_token.empty());
+    CHECK(registered.role == "user");
     tenriff::server::AccountSession duplicate;
     CHECK(!database.register_account("ranked-player", "another long password", duplicate, error));
 
@@ -300,6 +348,67 @@ void test_ranked_database_accounts_challenges_and_verified_records() {
     CHECK(!database.login("ranked-player", "wrong password value", login, error));
     CHECK(database.login("RANKED-PLAYER", "correct horse battery", login, error));
     CHECK(!login.bearer_token.empty());
+    CHECK(login.role == "user");
+
+    tenriff::server::AccountSession pre_admin_session;
+    CHECK(database.register_account("ryui", "old regular password", pre_admin_session, error));
+    const std::string admin_password = "admin password value only for tests";
+    CHECK(database.provision_admin_account("ryui", admin_password, error));
+    tenriff::server::GlobalChatMessage revoked_message;
+    CHECK(!database.send_global_chat(pre_admin_session.bearer_token,
+                                     "must be rejected", revoked_message, error));
+    tenriff::server::AccountSession admin;
+    CHECK(database.login("RYUI", admin_password, admin, error));
+    CHECK(admin.username == "ryui");
+    CHECK(admin.role == "admin");
+    sqlite3* inspect = nullptr;
+    CHECK(sqlite3_open_v2(path.string().c_str(), &inspect, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK);
+    if (inspect) {
+        sqlite3_stmt* statement = nullptr;
+        CHECK(sqlite3_prepare_v2(
+                  inspect,
+                  "SELECT password_salt,password_hash,password_iterations,role FROM users WHERE username='ryui'",
+                  -1, &statement, nullptr) == SQLITE_OK);
+        if (statement && sqlite3_step(statement) == SQLITE_ROW) {
+            const std::string salt = reinterpret_cast<const char*>(sqlite3_column_text(statement, 0));
+            const std::string hash = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1));
+            const std::string role = reinterpret_cast<const char*>(sqlite3_column_text(statement, 3));
+            CHECK(salt.size() == 32);
+            CHECK(hash.size() == 64);
+            CHECK(hash != admin_password);
+            CHECK(sqlite3_column_int(statement, 2) == 600000);
+            CHECK(role == "admin");
+        } else {
+            CHECK(false);
+        }
+        if (statement) sqlite3_finalize(statement);
+        sqlite3_close(inspect);
+    }
+
+    tenriff::server::GlobalChatMessage chat_message;
+    error.clear();
+    CHECK(database.send_global_chat(admin.bearer_token,
+                                    "  [NP] Test Song - Test Artist  ",
+                                    chat_message, error));
+    CHECK(error.empty());
+    CHECK(chat_message.username == "ryui");
+    CHECK(chat_message.role == "admin");
+    CHECK(chat_message.text == "[NP] Test Song - Test Artist");
+    CHECK(chat_message.id > 0);
+    error.clear();
+    const auto chat_messages = database.global_chat_messages(
+        login.bearer_token, 0, 100, error);
+    CHECK(error.empty());
+    CHECK(chat_messages.size() == 1);
+    if (!chat_messages.empty()) {
+        CHECK(chat_messages[0].id == chat_message.id);
+        CHECK(chat_messages[0].username == "ryui");
+        CHECK(chat_messages[0].role == "admin");
+        CHECK(chat_messages[0].text == "[NP] Test Song - Test Artist");
+    }
+    error.clear();
+    CHECK(database.global_chat_messages("invalid-token", 0, 100, error).empty());
+    CHECK(!error.empty());
 
     const std::string chart_hash(64, 'b');
     CHECK(database.approve_bms_chart(chart_hash, "catalog/chart.bms", error));
@@ -333,6 +442,32 @@ void test_ranked_database_accounts_challenges_and_verified_records() {
         CHECK(leaderboard[0].verification_status == "online_verified");
     }
 
+    tenriff::server::ReplayChallenge lower_challenge;
+    CHECK(database.create_challenge(login.bearer_token, chart_hash,
+                                    lower_challenge, error));
+    verified.replay_sha256 = std::string(64, 'd');
+    verified.score = 9000;
+    verified.accuracy = 99.0;
+    CHECK(database.commit_verified_replay(login.bearer_token,
+                                          lower_challenge.id,
+                                          verified, receipt, error));
+    auto best_records = database.leaderboard(chart_hash, 10);
+    CHECK(best_records.size() == 1);
+    CHECK(!best_records.empty() && best_records[0].score == 9876);
+
+    tenriff::server::ReplayChallenge better_challenge;
+    CHECK(database.create_challenge(login.bearer_token, chart_hash,
+                                    better_challenge, error));
+    verified.replay_sha256 = std::string(64, 'f');
+    verified.score = 10000;
+    verified.accuracy = 97.0;
+    CHECK(database.commit_verified_replay(login.bearer_token,
+                                          better_challenge.id,
+                                          verified, receipt, error));
+    best_records = database.leaderboard(chart_hash, 10);
+    CHECK(best_records.size() == 1);
+    CHECK(!best_records.empty() && best_records[0].score == 10000);
+
     tenriff::server::ReplayChallenge overflow_challenge;
     CHECK(database.create_challenge(login.bearer_token, chart_hash,
                                     overflow_challenge, error));
@@ -343,6 +478,51 @@ void test_ranked_database_accounts_challenges_and_verified_records() {
                                            verified, receipt, error));
     CHECK(database.inspect_challenge(login.bearer_token,
                                      overflow_challenge.id, inspected, error));
+
+    CHECK(database.sync_bms_catalog({}, error));
+    tenriff::server::ReplayChallenge disabled;
+    CHECK(!database.create_challenge(login.bearer_token, chart_hash,
+                                     disabled, error));
+    CHECK(!database.inspect_challenge(login.bearer_token,
+                                      overflow_challenge.id, inspected, error));
+    CHECK(database.leaderboard(chart_hash, 10).empty());
+
+    CHECK(database.sync_bms_catalog({{chart_hash, "catalog/chart.bms"}}, error));
+    CHECK(database.leaderboard(chart_hash, 10).size() == 1);
+    CHECK(database.create_challenge(login.bearer_token, chart_hash,
+                                    disabled, error));
+}
+
+void test_ranked_database_materializes_available_charts_lazily() {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "tenriff_server_lazy_catalog_test.sqlite3";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(path.string() + "-wal", ignored);
+    std::filesystem::remove(path.string() + "-shm", ignored);
+
+    tenriff::server::RankedDatabase database;
+    std::string error;
+    CHECK(database.open(path.string(), std::string(48, 'l'), error));
+    tenriff::server::AccountSession account;
+    CHECK(database.register_account("lazy-player", "correct horse battery", account, error));
+
+    const std::string chart_hash(64, 'a');
+    CHECK(database.set_available_bms_catalog(
+        {{chart_hash, "catalog/lazy-chart.bms"}}, error));
+    CHECK(database.registered_bms_chart_count() == 0);
+    CHECK(database.leaderboard(chart_hash, 10).empty());
+
+    tenriff::server::ReplayChallenge challenge;
+    CHECK(database.create_challenge(account.bearer_token, chart_hash, challenge, error));
+    CHECK(challenge.chart_path == "catalog/lazy-chart.bms");
+    CHECK(database.registered_bms_chart_count() == 1);
+
+    CHECK(database.set_available_bms_catalog({}, error));
+    tenriff::server::ReplayChallenge rejected;
+    CHECK(!database.create_challenge(account.bearer_token, chart_hash, rejected, error));
+    CHECK(!database.inspect_challenge(account.bearer_token, challenge.id, rejected, error));
+    CHECK(database.leaderboard(chart_hash, 10).empty());
 }
 
 #ifdef _WIN32
@@ -626,6 +806,9 @@ void test_http_account_and_bms_challenge_api() {
     options.bind_address = "127.0.0.1";
     options.port = 0;
     options.verifier_executable = TENRIFF_TEST_VERIFIER_PATH;
+    options.multiplayer_directory =
+        std::make_shared<tenriff::server::MultiplayerDirectory>();
+    options.multiplayer_directory->update("API Test Room", 27301, 2, 8, false);
     tenriff::server::HttpApiServer api(options, store, &database);
     std::atomic_bool stop{false};
     std::string api_error;
@@ -646,8 +829,56 @@ void test_http_account_and_bms_challenge_api() {
         std::to_string(account_body.size()) + "\r\n\r\n" + account_body));
     const std::string account_response = receive_http(account);
     CHECK(account_response.find("HTTP/1.1 201 Created") != std::string::npos);
+    CHECK(account_response.find("\"role\":\"user\"") != std::string::npos);
     const std::string token = response_json_string(account_response, "token");
     CHECK(!token.empty());
+
+    const std::string chat_body = "{\"text\":\"hello global chat\"}";
+    TestClient chat_send;
+    CHECK(connect_client(chat_send, api.bound_port()));
+    CHECK(send_raw(chat_send,
+        "POST /v1/chat/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token +
+        "\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(chat_body.size()) + "\r\n\r\n" + chat_body));
+    const std::string chat_send_response = receive_http(chat_send);
+    CHECK(chat_send_response.find("HTTP/1.1 201 Created") != std::string::npos);
+    CHECK(chat_send_response.find("\"text\":\"hello global chat\"") != std::string::npos);
+
+    TestClient chat_fetch;
+    CHECK(connect_client(chat_fetch, api.bound_port()));
+    CHECK(send_raw(chat_fetch,
+        "GET /v1/chat/messages?after_id=0&limit=100 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " +
+        token + "\r\n\r\n"));
+    const std::string chat_fetch_response = receive_http(chat_fetch);
+    CHECK(chat_fetch_response.find("HTTP/1.1 200 OK") != std::string::npos);
+    CHECK(chat_fetch_response.find("\"username\":\"http-player\"") != std::string::npos);
+    CHECK(chat_fetch_response.find("\"text\":\"hello global chat\"") != std::string::npos);
+
+    TestClient rooms_fetch;
+    CHECK(connect_client(rooms_fetch, api.bound_port()));
+    CHECK(send_raw(rooms_fetch,
+        "GET /v1/multiplayer/rooms HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " +
+        token + "\r\n\r\n"));
+    const std::string rooms_fetch_response = receive_http(rooms_fetch);
+    CHECK(rooms_fetch_response.find("HTTP/1.1 200 OK") != std::string::npos);
+    CHECK(rooms_fetch_response.find("\"name\":\"API Test Room\"") != std::string::npos);
+    CHECK(rooms_fetch_response.find("\"tcp_port\":27301") != std::string::npos);
+    CHECK(rooms_fetch_response.find("\"player_count\":2") != std::string::npos);
+    CHECK(rooms_fetch_response.find("\"accepting_players\":true") != std::string::npos);
+
+    TestClient rooms_unauthorized;
+    CHECK(connect_client(rooms_unauthorized, api.bound_port()));
+    CHECK(send_raw(rooms_unauthorized,
+        "GET /v1/multiplayer/rooms HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    CHECK(receive_http(rooms_unauthorized).find("HTTP/1.1 401 Unauthorized") !=
+          std::string::npos);
+
+    TestClient chat_unauthorized;
+    CHECK(connect_client(chat_unauthorized, api.bound_port()));
+    CHECK(send_raw(chat_unauthorized,
+        "GET /v1/chat/messages HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    CHECK(receive_http(chat_unauthorized).find("HTTP/1.1 401 Unauthorized") !=
+          std::string::npos);
 
     const std::string challenge_body =
         "{\"chart_sha256\":\"" + chart_hash + "\"}";
@@ -704,7 +935,9 @@ int main() {
     test_coordinator_full_round();
     test_coordinator_rejections_and_attribution();
     test_online_record_store_filters_and_sorts();
+    test_bms_catalog_default_allow_and_exclusions();
     test_ranked_database_accounts_challenges_and_verified_records();
+    test_ranked_database_materializes_available_charts_lazily();
     test_tcp_handshake_and_common_library();
     test_http_records_api();
     test_http_account_and_bms_challenge_api();

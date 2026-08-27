@@ -1,0 +1,2 @@
+# One SHA-256 per line. Add a chart hash here, then restart the server.
+# Lines beginning with # and blank lines are ignored.

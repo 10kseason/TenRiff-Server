@@ -1,8 +1,10 @@
+#include "tenriff_server/BmsCatalog.h"
 #include "tenriff_server/TcpServer.h"
 #include "tenriff_server/HttpApiServer.h"
 #include "tenriff_server/OnlineRecordStore.h"
 #include "tenriff_server/RankedDatabase.h"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -11,6 +13,7 @@
 #include <iostream>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -47,10 +50,11 @@ void signal_handler(int) {
 
 void print_help() {
     std::cout
-        << "TenRiff Server 1.0.0\n"
+        << "TenRiff Server 1.1.0\n"
         << "Usage: tenriff-server [options]\n\n"
-        << "  --bind <IPv4>       Game/API listen address (default: 0.0.0.0)\n"
-        << "  --port <port>       Game protocol TCP port (default: 27300)\n"
+        << "  --bind <IPv4>       Game protocol listen address (default: 0.0.0.0)\n"
+        << "  --api-bind <IPv4>   HTTP API listen address (default: 127.0.0.1)\n"
+        << "  --port <port>       Game protocol TCP port (default: 27301)\n"
         << "  --api-port <port>   Account/records HTTP port (default: 27302)\n"
         << "  --records <path>    Verified BMS records JSONL snapshot\n"
         << "  --database <path>   SQLite ranked database\n"
@@ -59,6 +63,13 @@ void print_help() {
         << "  --replay-staging <path>  Temporary replay evidence directory\n"
         << "  --approve-chart <sha256=path> Add/update approved BMS chart (repeatable)\n"
         << "  --approve-chart-file <path> Read SHA256=path catalog lines\n"
+        << "  --catalog-file <path> Read lazy SHA256=path availability catalog\n"
+        << "  --chart-root <path> Recursively catalog BMS files for lazy ranking\n"
+        << "  --exclude-chart-file <path> SHA-256 denylist applied to --chart-root\n"
+        << "  --provision-admin <name> Create or rotate an administrator account\n"
+        << "  --admin-password-file <path> One-time password file for --provision-admin\n"
+        << "  --provision-only    Exit after administrator provisioning\n"
+        << "  --trust-proxy-client-ip Trust Caddy's overwritten client-IP header\n"
         << "  --name <text>       Server name (max 64 UTF-8 bytes)\n"
         << "  --help              Show this help\n";
 }
@@ -82,25 +93,36 @@ int main(int argc, char** argv) {
     std::string records_path;
     std::string database_path;
     std::string receipt_secret_file;
+    std::string chart_root;
+    std::string excluded_chart_file;
+    std::string provision_admin;
+    std::string admin_password_file;
+    bool provision_only = false;
     std::vector<std::pair<std::string, std::string>> approved_charts;
+    std::vector<std::pair<std::string, std::string>> available_charts;
+    bool available_catalog_requested = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
             print_help();
             return 0;
         }
-        if ((argument == "--bind" || argument == "--port" ||
+        if ((argument == "--bind" || argument == "--api-bind" || argument == "--port" ||
              argument == "--api-port" || argument == "--records" ||
              argument == "--database" || argument == "--receipt-secret-file" ||
              argument == "--verifier" || argument == "--replay-staging" ||
              argument == "--approve-chart" || argument == "--approve-chart-file" ||
+             argument == "--catalog-file" ||
+             argument == "--chart-root" || argument == "--exclude-chart-file" ||
+             argument == "--provision-admin" || argument == "--admin-password-file" ||
              argument == "--name") && index + 1 >= argc) {
             std::cerr << argument << " requires a value.\n";
             return 2;
         }
         if (argument == "--bind") {
             options.bind_address = argv[++index];
-            api_options.bind_address = options.bind_address;
+        } else if (argument == "--api-bind") {
+            api_options.bind_address = argv[++index];
         } else if (argument == "--port") {
             if (!parse_port(argv[++index], options.port)) {
                 std::cerr << "--port must be between 1 and 65535.\n";
@@ -151,6 +173,37 @@ int main(int argc, char** argv) {
                 }
                 approved_charts.emplace_back(line.substr(0, equals), line.substr(equals + 1));
             }
+        } else if (argument == "--catalog-file") {
+            const std::string catalog_path = argv[++index];
+            std::ifstream catalog(catalog_path);
+            if (!catalog) {
+                std::cerr << "Could not open BMS availability catalog: " << catalog_path << "\n";
+                return 2;
+            }
+            available_catalog_requested = true;
+            std::string line;
+            while (std::getline(catalog, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty() || line.front() == '#') continue;
+                const auto equals = line.find('=');
+                if (equals == std::string::npos || equals == 0 || equals + 1 >= line.size()) {
+                    std::cerr << "Invalid BMS availability catalog line: " << line << "\n";
+                    return 2;
+                }
+                available_charts.emplace_back(line.substr(0, equals), line.substr(equals + 1));
+            }
+        } else if (argument == "--chart-root") {
+            chart_root = argv[++index];
+        } else if (argument == "--exclude-chart-file") {
+            excluded_chart_file = argv[++index];
+        } else if (argument == "--provision-admin") {
+            provision_admin = argv[++index];
+        } else if (argument == "--admin-password-file") {
+            admin_password_file = argv[++index];
+        } else if (argument == "--provision-only") {
+            provision_only = true;
+        } else if (argument == "--trust-proxy-client-ip") {
+            api_options.trust_proxy_client_ip = true;
         } else if (argument == "--name") {
             options.name = argv[++index];
             if (options.name.empty() || options.name.size() > 64) {
@@ -162,6 +215,27 @@ int main(int argc, char** argv) {
             std::cerr << "Unknown option: " << argument << "\n";
             return 2;
         }
+    }
+
+    if (!excluded_chart_file.empty() && chart_root.empty()) {
+        std::cerr << "--exclude-chart-file requires --chart-root.\n";
+        return 2;
+    }
+    if (provision_admin.empty() != admin_password_file.empty()) {
+        std::cerr << "--provision-admin and --admin-password-file must be supplied together.\n";
+        return 2;
+    }
+    if (provision_only && provision_admin.empty()) {
+        std::cerr << "--provision-only requires --provision-admin.\n";
+        return 2;
+    }
+
+    if (api_options.bind_address.rfind("127.", 0) != 0 &&
+        api_options.bind_address != "::1" &&
+        !api_options.trust_proxy_client_ip) {
+        std::cerr << "TenRiff Server failed: a non-loopback --api-bind requires "
+                     "--trust-proxy-client-ip behind an HTTPS reverse proxy.\n";
+        return 2;
     }
 
 #ifdef _WIN32
@@ -184,10 +258,12 @@ int main(int argc, char** argv) {
     tenriff::server::RankedDatabase ranked_database;
     tenriff::server::RankedDatabase* ranked_database_ptr = nullptr;
     if (!database_path.empty() || !receipt_secret_file.empty() ||
-        !api_options.verifier_executable.empty() || !approved_charts.empty()) {
+        !api_options.verifier_executable.empty() || !approved_charts.empty() ||
+        available_catalog_requested || !chart_root.empty() || !provision_admin.empty()) {
         if (database_path.empty() || receipt_secret_file.empty() ||
-            api_options.verifier_executable.empty()) {
-            std::cerr << "TenRiff Server failed: --database, --receipt-secret-file, and --verifier are all required for ranked uploads.\n";
+            (!provision_only && api_options.verifier_executable.empty())) {
+            std::cerr << "TenRiff Server failed: --database and --receipt-secret-file are required; "
+                         "--verifier is also required unless --provision-only is used.\n";
             return 2;
         }
         std::ifstream secret_input(receipt_secret_file, std::ios::binary);
@@ -201,6 +277,56 @@ int main(int argc, char** argv) {
             std::cerr << "TenRiff Server failed: " << error << "\n";
             return 1;
         }
+        if (!provision_admin.empty()) {
+            std::ifstream password_input(admin_password_file, std::ios::binary);
+            std::string password((std::istreambuf_iterator<char>(password_input)),
+                                 std::istreambuf_iterator<char>());
+            while (!password.empty() &&
+                   (password.back() == '\r' || password.back() == '\n')) {
+                password.pop_back();
+            }
+            if (!password_input && password.empty()) {
+                std::cerr << "TenRiff Server failed: could not read administrator password file.\n";
+                return 1;
+            }
+            if (!ranked_database.provision_admin_account(
+                    provision_admin, password, error)) {
+                std::fill(password.begin(), password.end(), '\0');
+                std::cerr << "TenRiff Server failed: " << error << "\n";
+                return 1;
+            }
+            std::fill(password.begin(), password.end(), '\0');
+            std::cout << "[TenRiff-Server] Provisioned administrator account '"
+                      << provision_admin << "'.\n";
+            if (provision_only) return 0;
+        }
+        if (!chart_root.empty()) {
+            tenriff::server::BmsCatalogLoadResult catalog;
+            if (!tenriff::server::load_bms_catalog(
+                    std::filesystem::u8path(chart_root),
+                    excluded_chart_file.empty()
+                        ? std::filesystem::path{}
+                        : std::filesystem::u8path(excluded_chart_file),
+                    catalog, error)) {
+                std::cerr << "TenRiff Server failed: " << error << "\n";
+                return 1;
+            }
+            available_charts.reserve(available_charts.size() + catalog.charts.size());
+            for (const auto& chart : catalog.charts) {
+                available_charts.emplace_back(chart.chart_sha256, chart.chart_path);
+            }
+            available_catalog_requested = true;
+            std::cout << "[TenRiff-Server] Cataloged " << catalog.charts.size()
+                      << " BMS files from " << chart_root << "; excluded "
+                      << catalog.excluded_count << ", duplicate hashes "
+                      << catalog.duplicate_count << ", skipped symlinks "
+                      << catalog.skipped_symlink_count << ".\n";
+        }
+        if (available_catalog_requested &&
+            !ranked_database.set_available_bms_catalog(available_charts, error)) {
+            std::cerr << "TenRiff Server failed: " << error << "\n";
+            return 1;
+        }
         for (const auto& approved : approved_charts) {
             if (!ranked_database.approve_bms_chart(approved.first, approved.second, error)) {
                 std::cerr << "TenRiff Server failed: " << error << "\n";
@@ -208,9 +334,16 @@ int main(int argc, char** argv) {
             }
         }
         ranked_database_ptr = &ranked_database;
-        std::cout << "[TenRiff-Server] Ranked DB migrations applied; account and replay upload API enabled.\n";
+        std::cout << "[TenRiff-Server] Ranked DB migrations applied; "
+                  << available_charts.size() << " BMS files available, "
+                  << ranked_database.registered_bms_chart_count()
+                  << " materialized for leaderboards.\n";
     }
 
+    const auto multiplayer_directory =
+        std::make_shared<tenriff::server::MultiplayerDirectory>();
+    options.multiplayer_directory = multiplayer_directory;
+    api_options.multiplayer_directory = multiplayer_directory;
     tenriff::server::HttpApiServer api(std::move(api_options), records, ranked_database_ptr);
     bool api_ok = false;
     std::string api_error;

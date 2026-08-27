@@ -6,9 +6,12 @@ services:
       - --bind
       - 0.0.0.0
       - --port
-      - "27300"
+      - "27301"
       - --api-port
       - "27302"
+      - --api-bind
+      - 0.0.0.0
+      - --trust-proxy-client-ip
       - --database
       - /var/lib/tenriff/tenriff.sqlite3
       - --receipt-secret-file
@@ -17,19 +20,23 @@ services:
       - /opt/tenriff/tenriff-replay-verifier
       - --replay-staging
       - /var/lib/tenriff/replay-staging
-      - --approve-chart-file
-      - /etc/tenriff/approved-charts.txt
+      - --catalog-file
+      - /etc/tenriff/generated-bms-catalog.txt
       - --name
       - ${TENRIFF_SERVER_NAME:-TenRiff Ranked Server}
     ports:
-      - "27300:27300/tcp"
+      - "27301:27301/tcp"
+      - "127.0.0.1:27302:27302/tcp"
     expose:
       - "27302"
     volumes:
       - tenriff-data:/var/lib/tenriff
-      - ./runtime/tenriff-replay-verifier:/opt/tenriff/tenriff-replay-verifier:ro
-      - ./catalog:/charts:ro
-      - ./catalog/approved-charts.txt:/etc/tenriff/approved-charts.txt:ro
+      - ./runtime:/opt/tenriff:ro
+      - "${TENRIFF_CHARTS_PATH:-./catalog}:/charts:ro"
+      - ./catalog/generated-bms-catalog.txt:/etc/tenriff/generated-bms-catalog.txt:ro
+    environment:
+      TENRIFF_NK3_BACKEND: NCNN_CPU
+      LD_LIBRARY_PATH: /opt/tenriff/lib
     secrets:
       - receipt-secret
     security_opt:
@@ -48,9 +55,8 @@ services:
     environment:
       TENRIFF_DOMAIN: ${TENRIFF_DOMAIN:-localhost}
     ports:
-      - "80:80/tcp"
-      - "443:443/tcp"
-      - "443:443/udp"
+      - "27303:443/tcp"
+      - "27303:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

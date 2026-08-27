@@ -358,6 +358,41 @@ std::size_t parse_limit(std::string_view query) {
     return limit;
 }
 
+std::int64_t parse_after_id(std::string_view query) {
+    while (!query.empty()) {
+        const auto separator = query.find('&');
+        const auto item = query.substr(0, separator);
+        if (item.rfind("after_id=", 0) == 0) {
+            std::int64_t value = 0;
+            const auto digits = item.substr(9);
+            const auto parsed = std::from_chars(digits.data(),
+                                                digits.data() + digits.size(), value);
+            if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() &&
+                value >= 0) {
+                return value;
+            }
+        }
+        if (separator == std::string_view::npos) break;
+        query.remove_prefix(separator + 1);
+    }
+    return 0;
+}
+
+std::string global_chat_json(const std::vector<GlobalChatMessage>& messages) {
+    std::string body = "{\"messages\":[";
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        if (index != 0) body.push_back(',');
+        const auto& message = messages[index];
+        body += "{\"id\":" + std::to_string(message.id) +
+                ",\"username\":\"" + escape_json(message.username) +
+                "\",\"role\":\"" + escape_json(message.role) +
+                "\",\"text\":\"" + escape_json(message.text) +
+                "\",\"created_at_utc\":\"" + escape_json(message.created_at_utc) + "\"}";
+    }
+    body += "]}";
+    return body;
+}
+
 struct Client {
     SocketHandle socket;
     std::string request;
@@ -408,8 +443,22 @@ struct HttpApiServer::Impl {
 
     bool allow_request(const std::string& remote, std::string_view request) {
         const bool sensitive = request.find(" /v1/accounts/") != std::string_view::npos ||
+                               request.find(" /v1/challenges") != std::string_view::npos ||
                                request.find(" /v1/replays") != std::string_view::npos;
-        return consume_rate_bucket("address:" + remote, sensitive ? 20 : 180);
+        return consume_rate_bucket(
+            "address:" + remote + (sensitive ? ":sensitive" : ":general"),
+            sensitive ? 20 : 180);
+    }
+
+    std::string rate_limit_address(const std::string& socket_remote,
+                                   std::string_view request) const {
+        if (!options.trust_proxy_client_ip) return socket_remote;
+        const auto forwarded = header_value(request, "x-tenriff-client-ip");
+        if (!forwarded.has_value()) return socket_remote;
+        in_addr parsed{};
+        return inet_pton(AF_INET, forwarded->c_str(), &parsed) == 1
+                   ? *forwarded
+                   : socket_remote;
     }
 
     SocketHandle create_listener(std::string& error) {
@@ -507,6 +556,39 @@ struct HttpApiServer::Impl {
                     ",\"ranked_formats\":[\"bms\"],\"tls_required\":true,"
                     "\"replay_verification\":\"server_rerun\"}");
         }
+        if (method == "GET" && path == "/v1/multiplayer/rooms") {
+            if (!ranked_database || !ranked_database->ready()) {
+                return json_error(503, "Service Unavailable",
+                                  "Multiplayer account sessions are not configured.");
+            }
+            const auto token = bearer_token(request);
+            if (!token.has_value()) {
+                return json_error(401, "Unauthorized", "Bearer token is required.");
+            }
+            std::string username;
+            std::string error;
+            if (!ranked_database->validate_session(*token, username, error)) {
+                return json_error(401, "Unauthorized", error);
+            }
+            const MultiplayerRoomStatus room = options.multiplayer_directory
+                                                     ? options.multiplayer_directory->snapshot()
+                                                     : MultiplayerRoomStatus{};
+            if (room.tcp_port == 0) {
+                return http_response(200, "OK",
+                                     "{\"schema_version\":1,\"rooms\":[]}");
+            }
+            return http_response(
+                200, "OK",
+                "{\"schema_version\":1,\"rooms\":[{\"id\":\"" +
+                    escape_json(room.id) + "\",\"name\":\"" +
+                    escape_json(room.name) + "\",\"tcp_port\":" +
+                    std::to_string(room.tcp_port) + ",\"player_count\":" +
+                    std::to_string(room.player_count) + ",\"max_players\":" +
+                    std::to_string(room.max_players) + ",\"accepting_players\":" +
+                    (room.accepting_players ? "true" : "false") +
+                    ",\"round_active\":" + (room.round_active ? "true" : "false") +
+                    ",\"revision\":" + std::to_string(room.revision) + "}]}");
+        }
         constexpr std::string_view prefix = "/v1/leaderboards/";
         if (method == "GET" && path.rfind(prefix, 0) == 0) {
             const std::string hash(path.substr(prefix.size()));
@@ -539,6 +621,7 @@ struct HttpApiServer::Impl {
             }
             return http_response(201, "Created",
                 "{\"username\":\"" + escape_json(session.username) +
+                "\",\"role\":\"" + escape_json(session.role) +
                 "\",\"token\":\"" + session.bearer_token +
                 "\",\"expires_at_utc\":\"" + session.expires_at_utc + "\"}");
         }
@@ -561,8 +644,47 @@ struct HttpApiServer::Impl {
             }
             return http_response(200, "OK",
                 "{\"username\":\"" + escape_json(session.username) +
+                "\",\"role\":\"" + escape_json(session.role) +
                 "\",\"token\":\"" + session.bearer_token +
                 "\",\"expires_at_utc\":\"" + session.expires_at_utc + "\"}");
+        }
+        if (method == "GET" && path == "/v1/chat/messages") {
+            if (!ranked_database || !ranked_database->ready()) {
+                return json_error(503, "Service Unavailable", "Global chat is not configured.");
+            }
+            const auto token = bearer_token(request);
+            if (!token.has_value()) {
+                return json_error(401, "Unauthorized", "Bearer token is required.");
+            }
+            std::string error;
+            const auto messages = ranked_database->global_chat_messages(
+                *token, parse_after_id(query), parse_limit(query), error);
+            if (!error.empty()) return json_error(401, "Unauthorized", error);
+            return http_response(200, "OK", global_chat_json(messages));
+        }
+        if (method == "POST" && path == "/v1/chat/messages") {
+            if (!ranked_database || !ranked_database->ready()) {
+                return json_error(503, "Service Unavailable", "Global chat is not configured.");
+            }
+            const auto token = bearer_token(request);
+            const auto text = json_string(request_body(request), "text");
+            if (!token.has_value()) {
+                return json_error(401, "Unauthorized", "Bearer token is required.");
+            }
+            if (!text.has_value()) {
+                return json_error(400, "Bad Request", "text is required.");
+            }
+            GlobalChatMessage message;
+            std::string error;
+            if (!ranked_database->send_global_chat(*token, *text, message, error)) {
+                const int status = error.find("wait") != std::string::npos ? 429 :
+                                   (error.find("session") != std::string::npos ? 401 : 422);
+                return json_error(status,
+                                  status == 429 ? "Too Many Requests" :
+                                  (status == 401 ? "Unauthorized" : "Unprocessable Content"),
+                                  error);
+            }
+            return http_response(201, "Created", global_chat_json({message}));
         }
         if (method == "POST" && path == "/v1/challenges") {
             if (!ranked_ready) {
@@ -783,7 +905,9 @@ struct HttpApiServer::Impl {
                             client.response = json_error(
                                 400, "Bad Request", "Content-Length is invalid.");
                         } else if (complete_http_request(client.request)) {
-                            client.response = allow_request(client.remote_address, client.request)
+                            const std::string rate_address =
+                                rate_limit_address(client.remote_address, client.request);
+                            client.response = allow_request(rate_address, client.request)
                                                   ? route(client.request)
                                                   : json_error(429, "Too Many Requests",
                                                                "Per-address request limit exceeded.");

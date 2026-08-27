@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(TenRiffServer VERSION 1.0.0 LANGUAGES CXX)
+project(TenRiffServer VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ if(TENRIFF_SERVER_ENABLE_ASAN)
 endif()
 
 add_library(tenriff_server_core
+    src/BmsCatalog.cpp
     src/Coordinator.cpp
     src/OnlineRecordStore.cpp
     src/Protocol.cpp

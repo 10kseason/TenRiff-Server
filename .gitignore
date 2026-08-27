@@ -11,6 +11,8 @@
 *.sqlite3-wal
 *.sqlite3-shm
 /secrets/
-/runtime/
+/runtime*/
+/.env
 /catalog/*
 !/catalog/approved-charts.txt
+!/catalog/excluded-charts.txt

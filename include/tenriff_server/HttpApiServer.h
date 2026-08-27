@@ -4,18 +4,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <memory>
 
 #include "tenriff_server/OnlineRecordStore.h"
 #include "tenriff_server/RankedDatabase.h"
+#include "tenriff_server/MultiplayerDirectory.h"
 
 namespace tenriff::server {
 
 struct HttpApiOptions {
-    std::string bind_address = "0.0.0.0";
+    std::string bind_address = "127.0.0.1";
     std::uint16_t port = 27302;
     std::string server_name = "TenRiff Headless Server";
     std::string verifier_executable;
     std::string replay_staging_directory = "data/replay-staging";
+    bool trust_proxy_client_ip = false;
+    std::shared_ptr<MultiplayerDirectory> multiplayer_directory;
 };
 
 class HttpApiServer {

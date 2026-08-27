@@ -47,6 +47,9 @@ constexpr auto kGracefulClose = std::chrono::milliseconds(250);
 constexpr std::size_t kMaxWireBytes = 128 * 1024;
 constexpr std::size_t kMaxReceiveBytes =
     2 * protocol::kMaxPayloadSize + protocol::kFrameHeaderSize;
+constexpr std::size_t kMaxAcceptedConnections = 32;
+constexpr std::size_t kMaxConnectionsPerAddress = 4;
+constexpr int kMaxAcceptsPerPoll = 16;
 
 #ifdef _WIN32
 using NativeSocket = SOCKET;
@@ -55,6 +58,7 @@ using SocketLength = int;
 
 int socket_error() { return WSAGetLastError(); }
 bool would_block(int error) { return error == WSAEWOULDBLOCK; }
+bool descriptor_exhausted(int error) { return error == WSAEMFILE; }
 void close_socket(NativeSocket socket) { closesocket(socket); }
 void shutdown_socket(NativeSocket socket) { shutdown(socket, SD_BOTH); }
 
@@ -78,6 +82,7 @@ using SocketLength = socklen_t;
 
 int socket_error() { return errno; }
 bool would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
+bool descriptor_exhausted(int error) { return error == EMFILE || error == ENFILE; }
 void close_socket(NativeSocket socket) { close(socket); }
 void shutdown_socket(NativeSocket socket) { shutdown(socket, SHUT_RDWR); }
 
@@ -209,6 +214,7 @@ struct Link {
     bool handshake_complete = false;
     bool close_after_flush = false;
     std::string name;
+    std::string remote_address;
     Clock::time_point accepted_at = Clock::now();
     Clock::time_point last_received = Clock::now();
     Clock::time_point last_ping_sent = Clock::now() - kHeartbeatInterval;
@@ -235,12 +241,31 @@ struct TcpServer::Impl {
     ConnectionId next_connection = 1;
     std::uint64_t next_ping_nonce = 1;
 
+    void publish_multiplayer_directory() {
+        if (!options.multiplayer_directory) return;
+        const RoomSnapshot room = coordinator.snapshot();
+        options.multiplayer_directory->update(
+            options.name,
+            listening_port.load(std::memory_order_acquire),
+            static_cast<std::uint8_t>((std::min)(
+                coordinator.player_count(),
+                static_cast<std::size_t>(protocol::kMaxPlayers))),
+            static_cast<std::uint8_t>(protocol::kMaxPlayers),
+            room.active_round_nonce != 0);
+    }
+
     SocketHandle create_listener(std::string& error) {
         SocketHandle listener(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
         if (!listener.valid()) {
             error = socket_error_text("socket", socket_error());
             return {};
         }
+#ifndef _WIN32
+        if (listener.get() >= FD_SETSIZE) {
+            error = "Game listener descriptor exceeds select capacity.";
+            return {};
+        }
+#endif
 #ifdef _WIN32
         const int exclusive = 1;
         if (setsockopt(listener.get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
@@ -309,7 +334,6 @@ struct TcpServer::Impl {
                 }
                 link.received.insert(link.received.end(), chunk.begin(),
                                      chunk.begin() + read);
-                link.last_received = Clock::now();
                 continue;
             }
             if (read == 0) {
@@ -338,6 +362,7 @@ struct TcpServer::Impl {
                 link.received.begin(),
                 link.received.begin() + static_cast<std::ptrdiff_t>(consumed));
             messages.push_back(std::move(message));
+            link.last_received = Clock::now();
             ++processed;
         }
         return true;
@@ -363,6 +388,7 @@ struct TcpServer::Impl {
             }
         }
         players.store(coordinator.player_count(), std::memory_order_release);
+        publish_multiplayer_directory();
     }
 
     void queue_disconnect(Link& link, const std::string& reason) {
@@ -403,7 +429,14 @@ struct TcpServer::Impl {
             if (!link.wire.push(pong, error)) queue_disconnect(link, error);
             return true;
         }
-        if (message.type == protocol::MessageType::Pong) return true;
+        if (message.type == protocol::MessageType::Pong) {
+            if (link.ping_nonce == 0 || message.nonce != link.ping_nonce) {
+                queue_disconnect(link, "Heartbeat response is invalid.");
+            } else {
+                link.ping_nonce = 0;
+            }
+            return true;
+        }
 
         auto result = coordinator.handle(link.connection, message);
         if (!result.success()) {
@@ -465,6 +498,7 @@ struct TcpServer::Impl {
         log_line("Listening on " + options.bind_address + ":" +
                  std::to_string(listening_port.load()) +
                  " (protocol v5, max 8 players). ");
+        publish_multiplayer_directory();
 
         std::vector<Link> links;
         links.reserve(protocol::kMaxPlayers + 4);
@@ -537,21 +571,49 @@ struct TcpServer::Impl {
             }
 
             if (!shutdown_announced && FD_ISSET(listener.get(), &read_set)) {
-                for (;;) {
+                for (int accepted_this_poll = 0;
+                     accepted_this_poll < kMaxAcceptsPerPoll;
+                     ++accepted_this_poll) {
                     sockaddr_in remote{};
                     SocketLength remote_size = static_cast<SocketLength>(sizeof(remote));
                     SocketHandle accepted(accept(
                         listener.get(), reinterpret_cast<sockaddr*>(&remote), &remote_size));
                     if (!accepted.valid()) {
                         const int code = socket_error();
-                        if (would_block(code)) break;
+                        if (would_block(code) || descriptor_exhausted(code)) break;
                         error = socket_error_text("accept", code);
                         return false;
                     }
-                    if (!configure_peer(accepted.get(), error)) return false;
+#ifndef _WIN32
+                    if (accepted.get() >= FD_SETSIZE) {
+                        shutdown_socket(accepted.get());
+                        continue;
+                    }
+#endif
+                    std::array<char, INET_ADDRSTRLEN> remote_text{};
+                    const char* remote_value = inet_ntop(
+                        AF_INET, &remote.sin_addr, remote_text.data(),
+                        static_cast<SocketLength>(remote_text.size()));
+                    const std::string remote_address =
+                        remote_value ? std::string(remote_value) : std::string("unknown");
+                    const std::size_t from_address = static_cast<std::size_t>(
+                        std::count_if(links.begin(), links.end(), [&](const Link& link) {
+                            return link.remote_address == remote_address;
+                        }));
+                    if (links.size() >= kMaxAcceptedConnections ||
+                        from_address >= kMaxConnectionsPerAddress) {
+                        shutdown_socket(accepted.get());
+                        continue;
+                    }
+                    std::string peer_error;
+                    if (!configure_peer(accepted.get(), peer_error)) {
+                        shutdown_socket(accepted.get());
+                        continue;
+                    }
                     Link link;
                     link.socket = std::move(accepted);
                     link.connection = next_connection++;
+                    link.remote_address = remote_address;
                     link.received.reserve(16 * 1024);
                     protocol::Message hello;
                     hello.type = protocol::MessageType::Hello;
@@ -609,6 +671,7 @@ struct TcpServer::Impl {
         for (auto& link : links) shutdown_socket(link.socket.get());
         players.store(0, std::memory_order_release);
         listening_port.store(0, std::memory_order_release);
+        publish_multiplayer_directory();
         log_line("Stopped.");
         return true;
     }
