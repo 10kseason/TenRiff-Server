@@ -50,7 +50,7 @@ void signal_handler(int) {
 
 void print_help() {
     std::cout
-        << "TenRiff Server 1.1.0\n"
+        << "TenRiff Server 1.1.1\n"
         << "Usage: tenriff-server [options]\n\n"
         << "  --bind <IPv4>       Game protocol listen address (default: 0.0.0.0)\n"
         << "  --api-bind <IPv4>   HTTP API listen address (default: 127.0.0.1)\n"

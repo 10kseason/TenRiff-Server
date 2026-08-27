@@ -38,6 +38,13 @@ ctest --test-dir build-compat -C Release --output-on-failure
 Linux는 SQLite3와 OpenSSL 개발 패키지가 필요합니다. `Dockerfile`은 필요한 패키지를 고정해
 Release 빌드와 CTest를 수행합니다.
 
+릴리즈의 `TenRiff-Server-windows-arm64.zip`은 Snapdragon Windows용 네이티브 ARM64
+서버, replay verifier, ncnn Vulkan 런타임을 함께 제공합니다. 압축을 푼 뒤
+`pwsh -File .\tools\test-snapdragon-gpu.ps1`로 Adreno Vulkan 실행을 강제 검증하고,
+`pwsh -File .\tools\start-windows-arm64.ps1 -ChartRoot "D:\BMS"`로 실행합니다.
+NCNN은 Hexagon NPU가 아니라 Vulkan GPU를 사용하며, 상세 절차는
+[`README-SNAPDRAGON.md`](README-SNAPDRAGON.md)에 있습니다.
+
 ## 직접 실행
 
 ```powershell

@@ -55,6 +55,94 @@ jobs:
           path: |
             ${{ matrix.artifact }}.*
 
+  windows-arm64:
+    runs-on: windows-11-arm
+    env:
+      CLIENT_COMMIT: 2f142dad67cf2879871156a5b4b2d28d28d95f6c
+      NCNN_ARCHIVE: ncnn-20260526-windows-vs2022-shared.zip
+      NCNN_SHA256: bd44f73ff210d523368ca77badfc8ae528281cb374185717c03b472d4f5a1754
+      ARTIFACT_NAME: TenRiff-Server-windows-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the matching replay verifier
+        uses: actions/checkout@v4
+        with:
+          repository: 10kseason/TenRiff
+          ref: ${{ env.CLIENT_COMMIT }}
+          path: TenRiff-client
+      - name: Download verified ARM64 ncnn Vulkan runtime
+        shell: pwsh
+        run: |
+          $uri = "https://github.com/Tencent/ncnn/releases/download/20260526/$env:NCNN_ARCHIVE"
+          Invoke-WebRequest -Uri $uri -OutFile $env:NCNN_ARCHIVE
+          $actual = (Get-FileHash -LiteralPath $env:NCNN_ARCHIVE -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:NCNN_SHA256) {
+            throw "ncnn SHA-256 mismatch: $actual"
+          }
+          Expand-Archive -LiteralPath $env:NCNN_ARCHIVE -DestinationPath ncnn-package
+          $root = (Resolve-Path "ncnn-package/ncnn-20260526-windows-vs2022-shared/arm64").Path
+          "NCNN_ARM64_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Configure ARM64 server
+        run: >-
+          cmake -S . -B build-arm64 -G "Visual Studio 17 2022" -A ARM64
+          -DTENRIFF_SERVER_BUILD_TESTS=ON
+      - name: Build and test ARM64 server
+        run: |
+          cmake --build build-arm64 --config Release --parallel
+          ctest --test-dir build-arm64 -C Release --output-on-failure
+      - name: Configure ARM64 replay verifier with ncnn Vulkan
+        shell: pwsh
+        run: |
+          cmake -S TenRiff-client -B client-build-arm64 -G "Visual Studio 17 2022" -A ARM64 `
+            -DTENRIFF_ENABLE_TESTS=ON `
+            -DTENRIFF_ENABLE_ONNX_UPSCALER=OFF `
+            -DTENRIFF_ENABLE_NK3_ONNX=ON `
+            -DTENRIFF_ENABLE_NK3_NCNN=ON `
+            "-Dncnn_DIR=$env:NCNN_ARM64_ROOT/lib/cmake/ncnn"
+      - name: Build and CPU-smoke ARM64 replay verifier
+        shell: pwsh
+        run: |
+          cmake --build client-build-arm64 --config Release --parallel `
+            --target tenriff_replay_verifier nk3_onnx_smoke
+          $env:TENRIFF_NK3_BACKEND = "NCNN_CPU"
+          ctest --test-dir client-build-arm64 -C Release `
+            -R "^nk3_onnx_smoke$" --output-on-failure
+      - name: Verify ARM64 PE machine type
+        shell: pwsh
+        run: |
+          $paths = @(
+            "build-arm64/Release/tenriff-server.exe",
+            "client-build-arm64/Release/tenriff-replay-verifier.exe",
+            "client-build-arm64/Release/ncnn.dll",
+            "client-build-arm64/Release/nk3_onnx_smoke.exe"
+          )
+          foreach ($path in $paths) {
+            ./tools/verify-pe-machine.ps1 -Path $path -ExpectedMachine ARM64
+          }
+      - name: Stage Windows ARM64 Snapdragon archive
+        shell: pwsh
+        run: |
+          $stage = "stage/TenRiff-Server"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item build-arm64/Release/tenriff-server.exe $stage/
+          Copy-Item client-build-arm64/Release/tenriff-replay-verifier.exe $stage/
+          Copy-Item client-build-arm64/Release/ncnn.dll $stage/
+          Copy-Item client-build-arm64/Release/nk3_onnx_smoke.exe $stage/
+          Copy-Item client-build-arm64/Release/models -Destination $stage -Recurse
+          Copy-Item README.md,README-SNAPDRAGON.md,SECURITY.md,LICENSE,Caddyfile,compose.yaml,.env.example $stage/
+          Copy-Item catalog,tools -Destination $stage -Recurse
+          $notice = "$stage/third_party/ncnn-20260526"
+          New-Item -ItemType Directory -Path $notice -Force | Out-Null
+          Copy-Item TenRiff-client/third_party/ncnn-20260526/LICENSE.txt $notice/
+          Compress-Archive $stage -DestinationPath "$env:ARTIFACT_NAME.zip"
+          (Get-FileHash "$env:ARTIFACT_NAME.zip" -Algorithm SHA256).Hash.ToLower() +
+            "  $env:ARTIFACT_NAME.zip" | Set-Content "$env:ARTIFACT_NAME.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.ARTIFACT_NAME }}.*
+
   container:
     runs-on: ubuntu-24.04
     steps:
@@ -79,7 +167,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   publish:
-    needs: [binaries, container]
+    needs: [binaries, windows-arm64, container]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
