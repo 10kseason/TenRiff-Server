@@ -25,7 +25,7 @@ jobs:
   arm64-runtime:
     runs-on: windows-11-arm
     env:
-      CLIENT_COMMIT: 2f142dad67cf2879871156a5b4b2d28d28d95f6c
+      CLIENT_COMMIT: 358b04fa73b45f76f9e01970d2fcea1fa2b3eef8
       NCNN_ARCHIVE: ncnn-20260526-windows-vs2022-shared.zip
       NCNN_SHA256: bd44f73ff210d523368ca77badfc8ae528281cb374185717c03b472d4f5a1754
     steps:
@@ -53,8 +53,11 @@ jobs:
         run: |
           cmake -S . -B build-arm64 -G "Visual Studio 17 2022" -A ARM64 `
             -DTENRIFF_SERVER_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build-arm64 --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ctest --test-dir build-arm64 -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and CPU-smoke native ARM64 replay verifier
         shell: pwsh
         run: |
@@ -64,11 +67,14 @@ jobs:
             -DTENRIFF_ENABLE_NK3_ONNX=ON `
             -DTENRIFF_ENABLE_NK3_NCNN=ON `
             "-Dncnn_DIR=$env:NCNN_ARM64_ROOT/lib/cmake/ncnn"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build client-build-arm64 --config Release --parallel `
             --target tenriff_replay_verifier nk3_onnx_smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:TENRIFF_NK3_BACKEND = "NCNN_CPU"
           ctest --test-dir client-build-arm64 -C Release `
             -R "^nk3_onnx_smoke$" --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify ARM64 PE machine type
         shell: pwsh
         run: |
