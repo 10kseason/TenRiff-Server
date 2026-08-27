@@ -1,7 +1,7 @@
 # TenRiff Server on Snapdragon Windows
 
 `TenRiff-Server-windows-arm64.zip` is a native Windows ARM64 package. It includes
-the server, the matching TenRiff 1.5.1 Hotfix 1 replay verifier, ARM64 ncnn, and
+the server, the matching TenRiff 1.5.1 Hotfix 4 replay verifier, ARM64 ncnn, and
 the converted NK3 models.
 
 The package uses the Snapdragon Adreno GPU through ncnn Vulkan. ncnn does not use
@@ -21,6 +21,10 @@ pwsh -File .\tools\test-snapdragon-gpu.ps1
 The script verifies that the executables and ncnn DLL are ARM64, then runs the
 bundled NK3 model with Vulkan forced. A pass is runtime evidence that this
 machine can execute TenRiff's verifier model on its Vulkan GPU.
+
+GitHub Actions verifies the native ARM64 build, server tests, and PE machine
+types, but its ARM runner has no Snapdragon Adreno Vulkan device. Therefore the
+package is not GPU-verified until this script passes on the target server.
 
 ## Start the server
 
