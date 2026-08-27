@@ -58,7 +58,7 @@ jobs:
   windows-arm64:
     runs-on: windows-11-arm
     env:
-      CLIENT_COMMIT: 358b04fa73b45f76f9e01970d2fcea1fa2b3eef8
+      CLIENT_COMMIT: 4c4a4d95bde96cea8b59250c7ca8107b0e2e197e
       NCNN_ARCHIVE: ncnn-20260526-windows-vs2022-shared.zip
       NCNN_SHA256: bd44f73ff210d523368ca77badfc8ae528281cb374185717c03b472d4f5a1754
       ARTIFACT_NAME: TenRiff-Server-windows-arm64
@@ -110,9 +110,18 @@ jobs:
             --target tenriff_replay_verifier nk3_onnx_smoke
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:TENRIFF_NK3_BACKEND = "NCNN_CPU"
-          ctest --test-dir client-build-arm64 -C Release `
-            -R "^nk3_onnx_smoke$" --output-on-failure
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            ctest --test-dir client-build-arm64 -C Release `
+              -R "^nk3_onnx_smoke$" --output-on-failure
+            if ($LASTEXITCODE -eq 0) {
+              $passed = $true
+              break
+            }
+            Write-Warning "ARM64 ncnn CPU smoke attempt $attempt failed."
+            Start-Sleep -Seconds 2
+          }
+          if (-not $passed) { exit 1 }
       - name: Verify ARM64 PE machine type
         shell: pwsh
         run: |

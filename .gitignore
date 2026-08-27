@@ -13,6 +13,7 @@
 /secrets/
 /runtime*/
 /.env
+/compose.override.yaml
 /catalog/*
 !/catalog/approved-charts.txt
 !/catalog/excluded-charts.txt

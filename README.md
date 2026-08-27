@@ -123,6 +123,20 @@ Compose는 Windows bind mount의 대규모 디렉터리 열거 지연을 피하�
 외부 HTTPS는 호스트의 `27303/TCP+UDP`로 공개됩니다. 따라서 원격 API 주소에는
 `https://도메인:27303`을 사용합니다.
 
+### TenRiff 공식 메인 IP
+
+공식 메인 API `https://121.174.18.181:27303`은 `Caddyfile.main`과
+`tools/TenRiff-Main-121.174.18.181.crt`의 전용 leaf 인증서를 사용합니다. 개인키는
+`secrets/main-api-key.pem`에만 두고 Git에 포함하지 않습니다. 운영 PC의 무시된
+`compose.override.yaml`에서 `Caddyfile.main`, 인증서, 개인키를 Caddy에 읽기 전용으로
+마운트합니다.
+
+Windows WinHTTP는 IP 주소 접속에 TLS SNI를 생략할 수 있으므로 `Caddyfile.main`의
+`default_sni`를 제거하지 마세요. 공식 클라이언트는 이 leaf 인증서의 DER SHA-256
+`29D8F573E13CE892B8E8D485334C18D104925057B084045DE240C6A257BE99BC`를 메인 API에만
+고정 검증합니다. 인증서를 교체할 때는 새 핀을 허용하는 클라이언트를 먼저 배포한 뒤 서버
+인증서를 전환해야 합니다. 사설 서버는 일반 도메인 인증서 검증을 그대로 사용합니다.
+
 DB 백업/복구는 서버를 정지한 상태에서 다음처럼 수행합니다.
 
 ```bash
