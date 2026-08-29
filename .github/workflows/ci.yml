@@ -25,7 +25,7 @@ jobs:
   arm64-runtime:
     runs-on: windows-11-arm
     env:
-      CLIENT_COMMIT: 358b04fa73b45f76f9e01970d2fcea1fa2b3eef8
+      CLIENT_COMMIT: 410634a97217ff2ad585f80ad7211ea662d65b4c
       NCNN_ARCHIVE: ncnn-20260526-windows-vs2022-shared.zip
       NCNN_SHA256: bd44f73ff210d523368ca77badfc8ae528281cb374185717c03b472d4f5a1754
     steps:

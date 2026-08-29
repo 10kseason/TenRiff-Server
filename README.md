@@ -35,6 +35,9 @@ cmake --build build-compat --config Release
 ctest --test-dir build-compat -C Release --output-on-failure
 ```
 
+CI와 ARM64 릴리즈의 replay verifier는 안정판 TenRiff 1.6.0 커밋
+`410634a97217ff2ad585f80ad7211ea662d65b4c`에 고정되어 있습니다.
+
 Linux는 SQLite3와 OpenSSL 개발 패키지가 필요합니다. `Dockerfile`은 필요한 패키지를 고정해
 Release 빌드와 CTest를 수행합니다.
 
@@ -126,10 +129,10 @@ Compose는 Windows bind mount의 대규모 디렉터리 열거 지연을 피하�
 ### TenRiff 공식 메인 IP
 
 공식 메인 API `https://121.174.18.181:27303`은 `Caddyfile.main`과
-`tools/TenRiff-Main-121.174.18.181.crt`의 전용 leaf 인증서를 사용합니다. 개인키는
+Git 제외 경로인 `secrets/main-api-cert.pem`의 전용 leaf 인증서를 사용합니다. 개인키도
 `secrets/main-api-key.pem`에만 두고 Git에 포함하지 않습니다. 운영 PC의 무시된
 `compose.override.yaml`에서 `Caddyfile.main`, 인증서, 개인키를 Caddy에 읽기 전용으로
-마운트합니다.
+마운트합니다. 인증서와 개인키는 소스·Docker context·릴리즈 압축 파일에 포함하지 않습니다.
 
 Windows WinHTTP는 IP 주소 접속에 TLS SNI를 생략할 수 있으므로 `Caddyfile.main`의
 `default_sni`를 제거하지 마세요. 공식 클라이언트는 이 leaf 인증서의 DER SHA-256

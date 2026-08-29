@@ -27,7 +27,8 @@ Bearer 원문은 DB에 저장하지 않고 SHA-256 digest와 24시간 만료만 
 공식 메인 IP API는 CA 권한이 없는 전용 self-signed leaf 인증서를 사용하며, 클라이언트가
 정확한 DER SHA-256을 핀으로 검증합니다. 클라이언트는 이름, 유효기간 등 나머지 Schannel
 검사를 유지하고 메인 IP의 unknown-CA 오류만 예외 처리합니다. 인증서 개인키는 서버의
-Git 제외 `secrets/`에만 보관합니다.
+Git 제외 `secrets/`에만 보관합니다. 공개 leaf 인증서를 포함한 모든 인증서 파일도 Git,
+Docker context, 릴리즈 압축 파일에서 제외하고 배포 호스트에 별도로 주입합니다.
 
 멀티플레이 `27301/TCP` 자체는 TLS가 아니므로 계정 token, 비밀번호, replay를 보내지 않습니다.
 민감 데이터는 HTTPS API에서만 처리합니다. API 내부 포트 `27302`는 인터넷에 직접 publish하지

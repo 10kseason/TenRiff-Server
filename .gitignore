@@ -17,3 +17,15 @@
 /catalog/*
 !/catalog/approved-charts.txt
 !/catalog/excluded-charts.txt
+
+# Deployment identity and credentials stay local. Release archives must not
+# contain certificates even when they only contain public material.
+*.pem
+*.crt
+*.cer
+*.der
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore

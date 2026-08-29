@@ -34,19 +34,36 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path stage/TenRiff-Server | Out-Null
-          Copy-Item build/Release/tenriff-server.exe stage/TenRiff-Server/
-          Copy-Item README.md,SECURITY.md,LICENSE,Caddyfile,compose.yaml,.env.example stage/TenRiff-Server/
-          Copy-Item catalog,tools -Destination stage/TenRiff-Server -Recurse
+          $stage = "stage/TenRiff-Server"
+          New-Item -ItemType Directory -Path "$stage/tools" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$stage/catalog" -Force | Out-Null
+          Copy-Item build/Release/tenriff-server.exe $stage/
+          Copy-Item README.md,SECURITY.md,LICENSE,Caddyfile,compose.yaml,.env.example $stage/
+          Copy-Item catalog/approved-charts.txt,catalog/excluded-charts.txt "$stage/catalog/"
+          $supportTools = @(
+            "database_backup.py",
+            "refresh-ranked-catalog.ps1",
+            "start-windows-arm64.ps1",
+            "test-snapdragon-gpu.ps1",
+            "verify-pe-machine.ps1"
+          )
+          foreach ($tool in $supportTools) {
+            Copy-Item "tools/$tool" "$stage/tools/"
+          }
+          python tools/verify_release_hygiene.py $stage
           Compress-Archive stage/TenRiff-Server -DestinationPath "${{ matrix.artifact }}.zip"
           (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower() +
             "  ${{ matrix.artifact }}.zip" | Set-Content "${{ matrix.artifact }}.sha256" -Encoding ascii
       - name: Stage Linux archive
         if: runner.os == 'Linux'
         run: |
-          mkdir -p stage/TenRiff-Server
+          mkdir -p stage/TenRiff-Server/tools stage/TenRiff-Server/catalog
           cp build/tenriff-server README.md SECURITY.md LICENSE Caddyfile compose.yaml .env.example stage/TenRiff-Server/
-          cp -r catalog tools stage/TenRiff-Server/
+          cp catalog/approved-charts.txt catalog/excluded-charts.txt stage/TenRiff-Server/catalog/
+          cp tools/database_backup.py tools/refresh-ranked-catalog.ps1 \
+            tools/start-windows-arm64.ps1 tools/test-snapdragon-gpu.ps1 \
+            tools/verify-pe-machine.ps1 stage/TenRiff-Server/tools/
+          python3 tools/verify_release_hygiene.py stage/TenRiff-Server
           tar -C stage -czf "${{ matrix.artifact }}.tar.gz" TenRiff-Server
           sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.sha256"
       - uses: actions/upload-artifact@v4
@@ -58,7 +75,7 @@ jobs:
   windows-arm64:
     runs-on: windows-11-arm
     env:
-      CLIENT_COMMIT: 4c4a4d95bde96cea8b59250c7ca8107b0e2e197e
+      CLIENT_COMMIT: 410634a97217ff2ad585f80ad7211ea662d65b4c
       NCNN_ARCHIVE: ncnn-20260526-windows-vs2022-shared.zip
       NCNN_SHA256: bd44f73ff210d523368ca77badfc8ae528281cb374185717c03b472d4f5a1754
       ARTIFACT_NAME: TenRiff-Server-windows-arm64
@@ -134,10 +151,23 @@ jobs:
           Copy-Item client-build-arm64/Release/nk3_onnx_smoke.exe $stage/
           Copy-Item client-build-arm64/Release/models -Destination $stage -Recurse
           Copy-Item README.md,README-SNAPDRAGON.md,SECURITY.md,LICENSE,Caddyfile,compose.yaml,.env.example $stage/
-          Copy-Item catalog,tools -Destination $stage -Recurse
+          New-Item -ItemType Directory -Path "$stage/catalog" -Force | Out-Null
+          Copy-Item catalog/approved-charts.txt,catalog/excluded-charts.txt "$stage/catalog/"
+          New-Item -ItemType Directory -Path "$stage/tools" -Force | Out-Null
+          $supportTools = @(
+            "database_backup.py",
+            "refresh-ranked-catalog.ps1",
+            "start-windows-arm64.ps1",
+            "test-snapdragon-gpu.ps1",
+            "verify-pe-machine.ps1"
+          )
+          foreach ($tool in $supportTools) {
+            Copy-Item "tools/$tool" "$stage/tools/"
+          }
           $notice = "$stage/third_party/ncnn-20260526"
           New-Item -ItemType Directory -Path $notice -Force | Out-Null
           Copy-Item TenRiff-client/third_party/ncnn-20260526/LICENSE.txt $notice/
+          python tools/verify_release_hygiene.py $stage
           Compress-Archive $stage -DestinationPath "$env:ARTIFACT_NAME.zip"
           (Get-FileHash "$env:ARTIFACT_NAME.zip" -Algorithm SHA256).Hash.ToLower() +
             "  $env:ARTIFACT_NAME.zip" | Set-Content "$env:ARTIFACT_NAME.sha256" -Encoding ascii
